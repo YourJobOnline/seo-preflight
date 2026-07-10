@@ -1,6 +1,11 @@
 import { parseHTML } from 'linkedom';
 import type { Check } from '$lib/types';
 
+export interface HreflangEntry {
+	lang: string;
+	href: string;
+}
+
 export interface PageAnalysis {
 	checks: Check[];
 	title: string | null;
@@ -8,6 +13,33 @@ export interface PageAnalysis {
 	internalLinks: string[];
 	noindex: boolean;
 	ogImage: string | null;
+	canonicalUrl: string | null;
+	hreflangs: HreflangEntry[];
+}
+
+/** Zelfde normalisatie als de crawler: hash weg, trailing slash weg (behalve root). */
+export function normalizeUrl(url: string): string {
+	const u = new URL(url);
+	u.hash = '';
+	if (u.pathname !== '/' && u.pathname.endsWith('/')) u.pathname = u.pathname.slice(0, -1);
+	return u.href;
+}
+
+/** Haalt alleen de hreflang-tags uit een HTML-document (voor de wederkerigheidscheck van de crawler). */
+export function parseHreflangs(html: string, baseUrl: string): HreflangEntry[] {
+	const { document } = parseHTML(html);
+	const entries: HreflangEntry[] = [];
+	for (const el of document.querySelectorAll('link[rel="alternate" i][hreflang]')) {
+		const lang = el.getAttribute('hreflang')?.trim();
+		const href = el.getAttribute('href')?.trim();
+		if (!lang || !href) continue;
+		try {
+			entries.push({ lang, href: new URL(href, baseUrl).href });
+		} catch {
+			/* ongeldige URL negeren */
+		}
+	}
+	return entries;
 }
 
 const TITLE_MIN = 30;
@@ -120,6 +152,7 @@ export function analyzePage(html: string, finalUrl: string, headers: Headers): P
 
 	// --- Canonical ---
 	const canonical = document.querySelector('link[rel="canonical" i]')?.getAttribute('href')?.trim();
+	let canonicalResolved: URL | null = null;
 	if (!canonical) {
 		checks.push({ id: 'canonical', label: 'Canonical', status: 'warn', message: 'Geen canonical-tag gevonden.' });
 	} else {
@@ -142,6 +175,7 @@ export function analyzePage(html: string, finalUrl: string, headers: Headers): P
 		} else if (!/^https?:$/.test(canonicalUrl.protocol)) {
 			checks.push({ id: 'canonical', label: 'Canonical', status: 'fail', message: `Canonical heeft een ongeldig protocol: ${canonical}` });
 		} else {
+			canonicalResolved = canonicalUrl;
 			checks.push({ id: 'canonical', label: 'Canonical', status: 'pass', message: canonicalUrl.href });
 		}
 	}
@@ -160,6 +194,19 @@ export function analyzePage(html: string, finalUrl: string, headers: Headers): P
 		});
 	} else {
 		checks.push({ id: 'noindex', label: 'Indexeerbaarheid', status: 'pass', message: 'Pagina is indexeerbaar (geen noindex).' });
+	}
+
+	// --- Canonical + noindex: tegenstrijdige signalen ---
+	// Een canonical naar een andere pagina zegt "indexeer díe URL", noindex zegt "indexeer niets".
+	// Google kan de noindex dan via de canonical laten doorwerken op de doelpagina.
+	if (noindex && canonicalResolved && normalizeUrl(canonicalResolved.href) !== normalizeUrl(finalUrl)) {
+		checks.push({
+			id: 'canonical-noindex',
+			label: 'Canonical + noindex',
+			status: 'fail',
+			message: 'Pagina heeft een canonical naar een andere URL én staat op noindex — tegenstrijdige signalen. Kies er één: óf canonical, óf noindex.',
+			details: [`canonical: ${canonicalResolved.href}`]
+		});
 	}
 
 	// --- Basis-hygiëne: lang, charset, viewport ---
@@ -207,6 +254,67 @@ export function analyzePage(html: string, finalUrl: string, headers: Headers): P
 		} catch {
 			checks.push({ id: 'og-url-host', label: 'Open Graph URL', status: 'warn', message: `og:url is geen geldige URL: ${ogUrl}` });
 		}
+	}
+
+	// --- Hreflang (meertalige sites) ---
+	const hreflangs: HreflangEntry[] = [];
+	const invalidHreflangs: string[] = [];
+	for (const el of document.querySelectorAll('link[rel="alternate" i][hreflang]')) {
+		const lang = el.getAttribute('hreflang')?.trim() || '';
+		const href = el.getAttribute('href')?.trim() || '';
+		if (!href) {
+			invalidHreflangs.push(`hreflang="${lang}" zonder href`);
+			continue;
+		}
+		try {
+			hreflangs.push({ lang, href: new URL(href, finalUrl).href });
+		} catch {
+			invalidHreflangs.push(`hreflang="${lang}" met ongeldige URL: ${href}`);
+		}
+	}
+	if (hreflangs.length > 0 || invalidHreflangs.length > 0) {
+		// Taalcodes: ISO 639-1, optioneel met regio (ISO 3166-1), of x-default
+		const badCodes = hreflangs
+			.filter((h) => h.lang.toLowerCase() !== 'x-default' && !/^[a-z]{2}(-[a-z]{2})?$/i.test(h.lang))
+			.map((h) => h.lang);
+		if (badCodes.length > 0 || invalidHreflangs.length > 0) {
+			checks.push({
+				id: 'hreflang-valid',
+				label: 'Hreflang',
+				status: 'fail',
+				message: 'Ongeldige hreflang-tags gevonden.',
+				details: [...badCodes.map((c) => `ongeldige taalcode: "${c}" (verwacht bijv. "nl" of "nl-BE")`), ...invalidHreflangs]
+			});
+		}
+
+		// Zelfverwijzing: elke pagina moet in zijn eigen hreflang-set staan
+		const self = normalizeUrl(finalUrl);
+		const hasSelf = hreflangs.some((h) => {
+			try {
+				return normalizeUrl(h.href) === self;
+			} catch {
+				return false;
+			}
+		});
+		checks.push(
+			hasSelf
+				? { id: 'hreflang-self', label: 'Hreflang zelfverwijzing', status: 'pass', message: 'De pagina verwijst in de hreflang-set naar zichzelf.' }
+				: {
+						id: 'hreflang-self',
+						label: 'Hreflang zelfverwijzing',
+						status: 'fail',
+						message: 'Geen hreflang-tag die naar deze pagina zelf verwijst — vereist, anders negeert Google de hele set.',
+						details: hreflangs.slice(0, 10).map((h) => `${h.lang} → ${h.href}`)
+					}
+		);
+
+		// x-default: vangnet voor talen die niet in de set zitten
+		const hasXDefault = hreflangs.some((h) => h.lang.toLowerCase() === 'x-default');
+		checks.push(
+			hasXDefault
+				? { id: 'hreflang-xdefault', label: 'Hreflang x-default', status: 'pass', message: 'x-default is ingesteld.' }
+				: { id: 'hreflang-xdefault', label: 'Hreflang x-default', status: 'warn', message: 'Geen x-default in de hreflang-set — stel in welke taalversie bezoekers buiten je doeltalen krijgen.' }
+		);
 	}
 
 	// --- Structured data ---
@@ -299,7 +407,16 @@ export function analyzePage(html: string, finalUrl: string, headers: Headers): P
 		}
 	}
 
-	return { checks, title, description, internalLinks, noindex, ogImage: og('image') || null };
+	return {
+		checks,
+		title,
+		description,
+		internalLinks,
+		noindex,
+		ogImage: og('image') || null,
+		canonicalUrl: canonicalResolved?.href ?? null,
+		hreflangs
+	};
 }
 
 // Aanbevolen velden per veelgebruikt schema.org-type

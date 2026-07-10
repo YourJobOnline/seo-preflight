@@ -126,10 +126,16 @@
 					/></svg
 				>
 			</div>
-			<div>
+			<div class="flex-1">
 				<h1 class="text-xl font-bold tracking-tight">SEO Preflight</h1>
 				<p class="text-sm text-slate-500">Check je site op SEO-basics vóór livegang</p>
 			</div>
+			<a
+				href="/migratie"
+				class="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-600 hover:border-slate-400"
+			>
+				📋 Migratie-checklist
+			</a>
 		</div>
 	</header>
 

@@ -1,7 +1,7 @@
 import { env } from '$env/dynamic/private';
 import type { AuditEvent, Check, PageResult, SiteResult } from '$lib/types';
 import { scoreChecks } from '$lib/types';
-import { analyzePage } from './page-checks';
+import { analyzePage, parseHreflangs, type HreflangEntry } from './page-checks';
 import { fetchVitals } from './vitals';
 
 export interface CrawlOptions {
@@ -34,6 +34,7 @@ export async function crawlSite(startUrl: string, opts: CrawlOptions): Promise<S
 	const seen = new Set<string>(queue);
 	const linkedFrom = new Map<string, Set<string>>();
 	const ogImages = new Map<string, Set<string>>();
+	const hreflangMap = new Map<string, HreflangEntry[]>();
 	const pages: PageResult[] = [];
 	let truncated = false;
 
@@ -112,6 +113,8 @@ export async function crawlSite(startUrl: string, opts: CrawlOptions): Promise<S
 		const analysis = analyzePage(html, finalUrl, res.headers);
 		checks.push(...analysis.checks);
 
+		if (analysis.hreflangs.length > 0) hreflangMap.set(normalize(finalUrl), analysis.hreflangs);
+
 		if (analysis.ogImage) {
 			try {
 				const resolved = new URL(analysis.ogImage, finalUrl).href;
@@ -165,7 +168,11 @@ export async function crawlSite(startUrl: string, opts: CrawlOptions): Promise<S
 	const robotsRes = await fetchUrl(`${start.origin}/robots.txt`, 'text/plain,*/*');
 	const robotsTxt = robotsRes?.ok ? await robotsRes.text() : null;
 
-	const siteChecks = await runSiteChecks(start, pages, fetchUrl, robotsTxt, ogImages);
+	const siteChecks = [
+		...(await runSiteChecks(start, pages, fetchUrl, robotsTxt, ogImages)),
+		...(await runHreflangChecks(hreflangMap, fetchUrl)),
+		...(await runDuplicateUrlChecks(start, pages, fetchUrl))
+	];
 	const geo = await runGeoChecks(start, pages, fetchUrl, robotsTxt);
 	const goLive = buildGoLiveChecklist(start, pages, siteChecks);
 	const vitals = await vitalsPromise;
@@ -430,6 +437,222 @@ async function runSiteChecks(
 	return checks;
 }
 
+/**
+ * Wederkerigheid van hreflang: als pagina A naar taalvariant B verwijst,
+ * moet B ook terugverwijzen naar A — anders negeert Google beide tags.
+ */
+async function runHreflangChecks(
+	hreflangMap: Map<string, HreflangEntry[]>,
+	fetchUrl: (url: string, accept?: string) => Promise<Response | null>
+): Promise<Check[]> {
+	if (hreflangMap.size === 0) return [];
+
+	// Taalvarianten kunnen op een ander (sub)domein staan en zijn dan niet meegecrawld — beperkt bijhalen
+	const MAX_EXTERNAL_FETCHES = 15;
+	const externalCache = new Map<string, HreflangEntry[] | null>();
+	let externalFetches = 0;
+	let limitReached = false;
+
+	async function getHreflangs(url: string): Promise<HreflangEntry[] | null> {
+		const key = normalize(url);
+		const crawled = hreflangMap.get(key);
+		if (crawled) return crawled;
+		if (externalCache.has(key)) return externalCache.get(key)!;
+		if (externalFetches >= MAX_EXTERNAL_FETCHES) {
+			limitReached = true;
+			return null;
+		}
+		externalFetches++;
+		const res = await fetchUrl(url);
+		const contentType = res?.headers.get('content-type') || '';
+		if (!res?.ok || !contentType.includes('text/html')) {
+			externalCache.set(key, null);
+			return null;
+		}
+		const entries = parseHreflangs(await res.text(), res.url || url);
+		externalCache.set(key, entries);
+		return entries;
+	}
+
+	const missing: string[] = [];
+	const unreachable: string[] = [];
+	const checkedPairs = new Set<string>();
+	for (const [sourceUrl, entries] of hreflangMap) {
+		for (const entry of entries) {
+			let target: string;
+			try {
+				target = normalize(entry.href);
+			} catch {
+				continue;
+			}
+			if (target === sourceUrl) continue;
+			const pairKey = `${sourceUrl}→${target}`;
+			if (checkedPairs.has(pairKey)) continue;
+			checkedPairs.add(pairKey);
+
+			const targetEntries = await getHreflangs(entry.href);
+			if (targetEntries === null) {
+				if (!limitReached) unreachable.push(`${entry.href} (${entry.lang}) — niet bereikbaar of geen HTML`);
+				continue;
+			}
+			const pointsBack = targetEntries.some((t) => {
+				try {
+					return normalize(t.href) === sourceUrl;
+				} catch {
+					return false;
+				}
+			});
+			if (!pointsBack) missing.push(`${target} verwijst niet terug naar ${sourceUrl} (${entry.lang})`);
+		}
+	}
+
+	const checks: Check[] = [];
+	checks.push(
+		missing.length > 0
+			? {
+					id: 'hreflang-reciprocal',
+					label: 'Hreflang wederkerigheid',
+					status: 'fail',
+					message: `${missing.length} hreflang-verwijzing(en) zonder terugverwijzing — Google negeert niet-wederkerige hreflang-paren.`,
+					details: missing.slice(0, 10)
+				}
+			: {
+					id: 'hreflang-reciprocal',
+					label: 'Hreflang wederkerigheid',
+					status: 'pass',
+					message: `Alle hreflang-verwijzingen zijn wederkerig (${hreflangMap.size} pagina's met hreflang gecheckt${limitReached ? `, externe varianten beperkt tot ${MAX_EXTERNAL_FETCHES}` : ''}).`
+				}
+	);
+	if (unreachable.length > 0) {
+		checks.push({
+			id: 'hreflang-unreachable',
+			label: 'Hreflang doelen',
+			status: 'warn',
+			message: `${unreachable.length} hreflang-doel(en) niet bereikbaar — controleer of deze taalvarianten bestaan.`,
+			details: unreachable.slice(0, 10)
+		});
+	}
+	return checks;
+}
+
+/**
+ * Duplicate content: iedere pagina hoort precies één indexeerbare URL te hebben.
+ * Test of varianten (www/non-www, trailing slash, hoofdletters) netjes redirecten of canonicaliseren.
+ */
+async function runDuplicateUrlChecks(
+	start: URL,
+	pages: PageResult[],
+	fetchUrl: (url: string, accept?: string) => Promise<Response | null>
+): Promise<Check[]> {
+	const stripHash = (url: string) => {
+		const u = new URL(url);
+		u.hash = '';
+		return u.href;
+	};
+
+	async function landsOn(url: string): Promise<{ finalUrl: string; status: number; canonical: string | null } | null> {
+		const res = await fetchUrl(url);
+		if (!res) return null;
+		let canonical: string | null = null;
+		if (res.status < 400 && (res.headers.get('content-type') || '').includes('text/html')) {
+			const html = await res.text();
+			const m =
+				html.match(/<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']+)["']/i) ??
+				html.match(/<link[^>]+href=["']([^"']+)["'][^>]*rel=["']canonical["']/i);
+			if (m) {
+				try {
+					canonical = stripHash(new URL(m[1], res.url || url).href);
+				} catch {
+					/* ongeldige canonical — al gemeld in page checks */
+				}
+			}
+		}
+		return { finalUrl: stripHash(res.url || url), status: res.status, canonical };
+	}
+
+	const okDetails: string[] = [];
+	const warnDetails: string[] = [];
+	const failDetails: string[] = [];
+
+	async function testVariant(label: string, original: string, variant: string): Promise<void> {
+		const [a, b] = [await landsOn(original), await landsOn(variant)];
+		if (!a) return;
+		if (!b) {
+			warnDetails.push(`${label}: ${variant} is niet bereikbaar — stel een redirect naar ${a.finalUrl} in.`);
+			return;
+		}
+		if (b.status >= 400) {
+			okDetails.push(`${label}: variant geeft ${b.status} — geen duplicate.`);
+			return;
+		}
+		if (b.finalUrl === a.finalUrl) {
+			okDetails.push(`${label}: redirect naar dezelfde URL.`);
+			return;
+		}
+		if (b.canonical && (b.canonical === a.finalUrl || b.canonical === a.canonical)) {
+			warnDetails.push(`${label}: ${variant} geeft 200 maar canonicaliseert naar de juiste URL — een 301-redirect is sterker.`);
+			return;
+		}
+		failDetails.push(`${label}: ${variant} is apart indexeerbaar (status ${b.status}, geen redirect of canonical naar ${a.finalUrl}).`);
+	}
+
+	// 1. www vs non-www (op de homepage)
+	const wwwVariant = new URL(start.href);
+	wwwVariant.host = start.host.startsWith('www.') ? start.host.slice(4) : `www.${start.host}`;
+	await testVariant('www/non-www', start.href, wwwVariant.href);
+
+	// 2 + 3. Trailing slash en hoofdletters (op een diepere pagina)
+	const samplePage = pages.find((p) => {
+		if (p.httpStatus < 200 || p.httpStatus >= 300) return false;
+		try {
+			const u = new URL(p.finalUrl);
+			return u.host === start.host && u.pathname.length > 1 && !u.search;
+		} catch {
+			return false;
+		}
+	});
+	if (samplePage) {
+		const base = new URL(samplePage.finalUrl);
+		const withSlash = new URL(base.href);
+		withSlash.pathname = base.pathname.endsWith('/') ? base.pathname.slice(0, -1) : `${base.pathname}/`;
+		await testVariant('trailing slash', base.href, withSlash.href);
+
+		const upper = new URL(base.href);
+		upper.pathname = base.pathname.toUpperCase();
+		if (upper.pathname !== base.pathname) {
+			await testVariant('hoofdletters', base.href, upper.href);
+		}
+	}
+
+	const checks: Check[] = [];
+	if (failDetails.length > 0) {
+		checks.push({
+			id: 'duplicate-urls',
+			label: 'Eén indexeerbare URL',
+			status: 'fail',
+			message: `${failDetails.length} URL-variant(en) zijn apart indexeerbaar — duplicate content. Redirect alle varianten (301) naar één voorkeurs-URL.`,
+			details: [...failDetails, ...warnDetails]
+		});
+	} else if (warnDetails.length > 0) {
+		checks.push({
+			id: 'duplicate-urls',
+			label: 'Eén indexeerbare URL',
+			status: 'warn',
+			message: 'URL-varianten zijn grotendeels op orde, met aandachtspunten.',
+			details: [...warnDetails, ...okDetails]
+		});
+	} else if (okDetails.length > 0) {
+		checks.push({
+			id: 'duplicate-urls',
+			label: 'Eén indexeerbare URL',
+			status: 'pass',
+			message: 'www/non-www, trailing slash en hoofdletter-varianten verwijzen allemaal naar één URL.',
+			details: okDetails
+		});
+	}
+	return checks;
+}
+
 // Bron: AI user-agent landscape, april 2026 (nohacks.co)
 const AI_SEARCH_BOTS = ['OAI-SearchBot', 'Claude-SearchBot', 'PerplexityBot', 'Bingbot', 'DuckAssistBot', 'Google-CloudVertexBot'];
 const AI_FETCHER_BOTS = ['ChatGPT-User', 'Claude-User', 'Perplexity-User', 'MistralAI-User'];
@@ -576,6 +799,15 @@ function buildGoLiveChecklist(start: URL, pages: PageResult[], siteChecks: Check
 
 	const brokenLinks = find('broken-links');
 	if (brokenLinks) goLive.push({ ...brokenLinks, id: 'golive-broken-links' });
+
+	// Niet automatisch te checken — vaste reminder
+	goLive.push({
+		id: 'golive-search-console',
+		label: 'Google Search Console',
+		status: 'info',
+		message:
+			'Reminder: voeg de site toe in Search Console, verifieer het domein en dien de sitemap in. Check na livegang de dekking op indexatiefouten.'
+	});
 
 	return goLive;
 }
