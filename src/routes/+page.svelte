@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { AuditEvent, Check, CheckStatus, PageResult, SiteResult } from '$lib/types';
+	import { applyAuditToChecklist, loadChecklist, saveChecklist, type ApplyResult } from '$lib/migratie';
 
 	let targetUrl = $state('');
 	let maxPages = $state(30);
@@ -23,6 +24,7 @@
 		pages = [];
 		site = null;
 		expanded = {};
+		applied = null;
 
 		const params = new URLSearchParams({ url: targetUrl.trim(), max: String(maxPages) });
 		if (useAuth && authUser) {
@@ -53,6 +55,28 @@
 		source = null;
 		running = false;
 		currentUrl = null;
+	}
+
+	let applied = $state<(ApplyResult & { project: string }) | null>(null);
+
+	function scanProject(s: SiteResult): string {
+		return new URL(s.startUrl).host.replace(/^www\./, '');
+	}
+
+	function applyToChecklist() {
+		if (!site) return;
+		const project = scanProject(site);
+		const checklist = loadChecklist(project);
+		const allChecks = [
+			...site.siteChecks,
+			...site.goLive,
+			...site.geo,
+			...site.vitals,
+			...site.pages.flatMap((p) => p.checks)
+		];
+		const result = applyAuditToChecklist(allChecks, checklist);
+		saveChecklist(project, checklist);
+		applied = { ...result, project };
 	}
 
 	const sortedPages = $derived([...pages].sort((a, b) => a.score - b.score));
@@ -230,6 +254,35 @@
 				Niet alle pagina's zijn gescand — het maximum van {maxPages} is bereikt.
 			</p>
 		{/if}
+
+		<!-- Scanresultaten doorzetten naar de migratie-checklist -->
+		<section class="mt-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+			{#if applied}
+				<p class="text-sm text-slate-700">
+					✅ Checklist van <span class="font-semibold">{applied.project}</span> bijgewerkt:
+					<span class="font-medium text-green-700">{applied.afgevinkt.length} afgevinkt</span>{#if applied.openstaand.length > 0},
+						<span class="font-medium text-amber-700">{applied.openstaand.length} openstaand met bevinding</span>{/if}.
+					<a href="/migratie?project={encodeURIComponent(applied.project)}" class="font-semibold underline">
+						Bekijk de checklist →
+					</a>
+				</p>
+			{:else}
+				<div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+					<p class="text-sm text-slate-600">
+						Zet deze scanresultaten door naar de migratie-checklist van
+						<span class="font-mono text-xs">{scanProject(site)}</span> — automatisch checkbare items (🤖)
+						worden afgevinkt of krijgen de bevinding als opmerking.
+					</p>
+					<button
+						type="button"
+						onclick={applyToChecklist}
+						class="shrink-0 rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-700"
+					>
+						📋 Checklist bijwerken
+					</button>
+				</div>
+			{/if}
+		</section>
 
 		<!-- Go-live checklist -->
 		<section class="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">

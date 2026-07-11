@@ -1,65 +1,42 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
+	import { page } from '$app/state';
 	import {
 		MIGRATIE_CHECKLIST,
+		STORAGE_PREFIX,
+		emptyItem,
+		listProjects,
+		loadChecklist,
+		saveChecklist,
 		type ItemState,
 		type MigratieState,
 		type Verantwoordelijke
 	} from '$lib/migratie';
-
-	const STORAGE_PREFIX = 'seo-preflight:migratie:';
 
 	let project = $state('');
 	let projecten = $state<string[]>([]);
 	let migratie = $state<MigratieState | null>(null);
 	let collapsed = $state<Record<string, boolean>>({});
 
-	$effect(() => {
-		projecten = Object.keys(localStorage)
-			.filter((k) => k.startsWith(STORAGE_PREFIX))
-			.map((k) => k.slice(STORAGE_PREFIX.length))
-			.sort();
+	onMount(() => {
+		projecten = listProjects();
+		// Direct openen als we vanaf de scanpagina komen (?project=domein.nl)
+		const fromQuery = page.url.searchParams.get('project');
+		if (fromQuery) openProject(fromQuery);
 	});
-
-	function emptyItem(): ItemState {
-		return { done: false, wie: '', opmerking: '' };
-	}
 
 	function openProject(name: string) {
 		const trimmed = name.trim().toLowerCase();
 		if (!trimmed) return;
 		project = trimmed;
-
-		// Alles vooraf initialiseren (state muteren tijdens renderen mag niet in Svelte 5)
-		const base: MigratieState = { items: {}, categorieOpmerkingen: {} };
-		for (const fase of MIGRATIE_CHECKLIST) {
-			for (const cat of fase.categorieen) {
-				base.categorieOpmerkingen[`${fase.id}:${cat.id}`] = '';
-				for (const it of cat.items) base.items[it.id] = emptyItem();
-			}
-		}
-
-		const raw = localStorage.getItem(STORAGE_PREFIX + trimmed);
-		if (raw) {
-			try {
-				const parsed = JSON.parse(raw) as MigratieState;
-				for (const [id, s] of Object.entries(parsed.items ?? {})) {
-					if (base.items[id]) base.items[id] = { ...emptyItem(), ...s };
-				}
-				for (const [key, note] of Object.entries(parsed.categorieOpmerkingen ?? {})) {
-					if (key in base.categorieOpmerkingen) base.categorieOpmerkingen[key] = note;
-				}
-			} catch {
-				/* corrupte opslag — begin opnieuw */
-			}
-		}
-		migratie = base;
+		migratie = loadChecklist(trimmed);
 	}
 
 	// Automatisch opslaan bij elke wijziging
 	$effect(() => {
 		if (!migratie || !project) return;
-		const snapshot = JSON.stringify(migratie);
-		localStorage.setItem(STORAGE_PREFIX + project, snapshot);
+		JSON.stringify(migratie); // dependencies registreren op de hele state
+		saveChecklist(project, migratie);
 		if (!projecten.includes(project)) projecten = [...projecten, project].sort();
 	});
 
@@ -227,6 +204,13 @@
 											/>
 											<span class="text-sm {s.done ? 'text-slate-400 line-through' : 'text-slate-700'}">
 												{taakItem.taak}
+												{#if taakItem.auto}
+													<span
+														class="ml-1 cursor-help text-xs"
+														title="Dit item wordt automatisch bijgewerkt als je een scan toepast op de checklist"
+														>🤖</span
+													>
+												{/if}
 											</span>
 										</label>
 										<div class="flex shrink-0 gap-2 pl-7 sm:pl-0">
@@ -244,6 +228,7 @@
 												type="text"
 												bind:value={s.opmerking}
 												placeholder="Opmerking…"
+												title={s.opmerking}
 												class="w-40 rounded-md border border-slate-200 px-2 py-1 text-xs focus:border-slate-400 focus:outline-none sm:w-52"
 											/>
 										</div>
