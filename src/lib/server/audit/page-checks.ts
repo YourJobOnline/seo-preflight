@@ -209,6 +209,40 @@ export function analyzePage(html: string, finalUrl: string, headers: Headers): P
 		});
 	}
 
+	// --- Robots nofollow ---
+	const nofollow = metaRobots.includes('nofollow') || xRobots.includes('nofollow');
+	checks.push(
+		nofollow
+			? {
+					id: 'nofollow',
+					label: 'Robots nofollow',
+					status: 'warn',
+					message: 'Pagina heeft een robots-nofollow-metatag — links op deze pagina worden niet gevolgd.',
+					details: [metaRobots.includes('nofollow') ? `meta robots: ${metaRobots}` : `X-Robots-Tag: ${xRobots}`]
+				}
+			: { id: 'nofollow', label: 'Robots nofollow', status: 'pass', message: 'Geen robots-nofollow-metatag.' }
+	);
+
+	// --- Analytics / Tag Manager ---
+	const scripts = [...document.querySelectorAll('script')];
+	const scriptSrcs = scripts.map((s) => s.getAttribute('src') || '');
+	const inlineScripts = scripts.map((s) => s.textContent || '').join('\n');
+	const hasGtm = scriptSrcs.some((src) => src.includes('googletagmanager.com/gtm.js')) || inlineScripts.includes('googletagmanager.com/gtm.js');
+	const hasGa =
+		hasGtm ||
+		scriptSrcs.some((src) => src.includes('googletagmanager.com/gtag/js') || src.includes('google-analytics.com/analytics.js')) ||
+		/gtag\s*\(\s*['"]config['"]/.test(inlineScripts);
+	checks.push(
+		hasGa
+			? { id: 'analytics', label: 'Analytics/Tag Manager', status: 'pass', message: `${hasGtm ? 'Google Tag Manager' : 'Google Analytics'} gevonden in de broncode.` }
+			: {
+					id: 'analytics',
+					label: 'Analytics/Tag Manager',
+					status: 'warn',
+					message: 'Geen Google Analytics- of Tag Manager-script gevonden in de broncode.'
+				}
+	);
+
 	// --- Basis-hygiëne: lang, charset, viewport ---
 	const lang = document.documentElement?.getAttribute('lang')?.trim();
 	checks.push(

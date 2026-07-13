@@ -2,12 +2,17 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import {
+		AUTO_NOTE_PREFIX,
+		MANUAL_REASON_ICON,
+		MANUAL_REASON_LABEL,
 		MIGRATIE_CHECKLIST,
 		STORAGE_PREFIX,
 		emptyItem,
+		getActionItems,
 		listProjects,
 		loadChecklist,
 		saveChecklist,
+		type ActionItem,
 		type ItemState,
 		type MigratieState,
 		type Verantwoordelijke
@@ -64,6 +69,18 @@
 			return { id: fase.id, ...categorieVoortgang(ids) };
 		})
 	);
+
+	const actionItems = $derived(migratie ? getActionItems(migratie) : []);
+	const actionGroups = $derived.by(() => {
+		const map = new Map<string, ActionItem[]>();
+		for (const it of actionItems) {
+			if (!map.has(it.faseTitel)) map.set(it.faseTitel, []);
+			map.get(it.faseTitel)!.push(it);
+		}
+		return [...map.entries()];
+	});
+	const autoActionCount = $derived(actionItems.filter((a) => a.isAuto).length);
+	let showActiepunten = $state(true);
 
 	const wieOpties: { value: Verantwoordelijke; label: string }[] = [
 		{ value: '', label: 'Wie?' },
@@ -169,6 +186,54 @@
 			{/each}
 		</section>
 
+		<!-- Actiepunten: wat staat er nog open, en waarom -->
+		{#if actionItems.length > 0}
+			<section class="mt-6 rounded-2xl border border-amber-200 bg-amber-50 p-5 shadow-sm">
+				<button type="button" class="flex w-full items-center justify-between text-left" onclick={() => (showActiepunten = !showActiepunten)}>
+					<h2 class="text-base font-semibold text-amber-900">📌 Actiepunten ({actionItems.length} openstaand)</h2>
+					<span class="text-xs text-amber-700">
+						{autoActionCount} uit scan · {actionItems.length - autoActionCount} handmatig
+						<span class="ml-1 text-amber-400">{showActiepunten ? '▾' : '▸'}</span>
+					</span>
+				</button>
+				{#if showActiepunten}
+					<div class="mt-3 space-y-4">
+						{#each actionGroups as [faseTitel, items]}
+							<div>
+								<p class="text-xs font-semibold tracking-wide text-amber-800 uppercase">{faseTitel}</p>
+								<ul class="mt-1.5 space-y-1.5">
+									{#each items as it}
+										<li class="rounded-lg bg-white/70 px-3 py-2 text-sm">
+											<div class="flex items-start justify-between gap-2">
+												<span class="text-slate-800">{it.taak}</span>
+												{#if it.isAuto}
+													{#if it.opmerking.startsWith(AUTO_NOTE_PREFIX)}
+														<span class="shrink-0 rounded-full bg-red-100 px-2 py-0.5 text-xs whitespace-nowrap text-red-700">🤖 scan-bevinding</span>
+													{:else}
+														<span class="shrink-0 rounded-full bg-blue-100 px-2 py-0.5 text-xs whitespace-nowrap text-blue-700">🤖 scanbaar</span>
+													{/if}
+												{:else if it.manualReason}
+													<span
+														class="shrink-0 cursor-help rounded-full bg-slate-100 px-2 py-0.5 text-xs whitespace-nowrap text-slate-600"
+														title={MANUAL_REASON_LABEL[it.manualReason]}
+													>
+														{MANUAL_REASON_ICON[it.manualReason]} {MANUAL_REASON_LABEL[it.manualReason]}
+													</span>
+												{/if}
+											</div>
+											{#if it.opmerking}
+												<p class="mt-1 text-xs text-slate-500">{it.opmerking}</p>
+											{/if}
+										</li>
+									{/each}
+								</ul>
+							</div>
+						{/each}
+					</div>
+				{/if}
+			</section>
+		{/if}
+
 		{#each MIGRATIE_CHECKLIST as fase}
 			<h2 class="mt-8 text-base font-semibold tracking-wide text-slate-900 uppercase">{fase.titel}</h2>
 			{#each fase.categorieen as cat}
@@ -209,6 +274,10 @@
 														class="ml-1 cursor-help text-xs"
 														title="Dit item wordt automatisch bijgewerkt als je een scan toepast op de checklist"
 														>🤖</span
+													>
+												{:else if taakItem.manualReason}
+													<span class="ml-1 cursor-help text-xs" title={MANUAL_REASON_LABEL[taakItem.manualReason]}
+														>{MANUAL_REASON_ICON[taakItem.manualReason]}</span
 													>
 												{/if}
 											</span>

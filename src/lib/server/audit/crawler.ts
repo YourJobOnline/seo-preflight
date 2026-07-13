@@ -12,6 +12,7 @@ export interface CrawlOptions {
 
 const CONCURRENCY = 4;
 const FETCH_TIMEOUT_MS = 15_000;
+const MAX_REDIRECT_HOPS = 10;
 const USER_AGENT = 'Mozilla/5.0 (compatible; SEO-Preflight/1.0)';
 
 function normalize(url: string): string {
@@ -19,6 +20,14 @@ function normalize(url: string): string {
 	u.hash = '';
 	if (u.pathname !== '/' && u.pathname.endsWith('/')) u.pathname = u.pathname.slice(0, -1);
 	return u.href;
+}
+
+function safeNormalize(url: string): string | null {
+	try {
+		return normalize(url);
+	} catch {
+		return null;
+	}
 }
 
 function baseHeaders(auth?: { user: string; pass: string }): Record<string, string> {
@@ -57,6 +66,33 @@ export async function crawlSite(startUrl: string, opts: CrawlOptions): Promise<S
 		}
 	}
 
+	/** Volgt redirects handmatig (i.p.v. auto-follow) om chains en statuscodes (301 vs 302) te kunnen zien. */
+	async function walkRedirects(startUrl: string): Promise<{ hops: { url: string; status: number }[]; error: boolean }> {
+		const hops: { url: string; status: number }[] = [];
+		let current = startUrl;
+		for (let i = 0; i < MAX_REDIRECT_HOPS; i++) {
+			let res: Response;
+			try {
+				res = await fetch(current, { headers, redirect: 'manual', signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+			} catch {
+				return { hops, error: true };
+			}
+			if (res.status >= 300 && res.status < 400) {
+				const location = res.headers.get('location');
+				if (!location) return { hops, error: true };
+				hops.push({ url: current, status: res.status });
+				try {
+					current = new URL(location, current).href;
+				} catch {
+					return { hops, error: true };
+				}
+				continue;
+			}
+			return { hops, error: false };
+		}
+		return { hops, error: true };
+	}
+
 	async function processUrl(url: string): Promise<void> {
 		opts.onEvent({ type: 'progress', crawled: pages.length, queued: queue.length, url });
 		const res = await fetchUrl(url);
@@ -66,7 +102,7 @@ export async function crawlSite(startUrl: string, opts: CrawlOptions): Promise<S
 			const checks: Check[] = [
 				{ id: 'http-status', label: 'Bereikbaarheid', status: 'fail', message: 'Pagina niet bereikbaar (timeout of netwerkfout).' }
 			];
-			const page: PageResult = { url, finalUrl: url, httpStatus: 0, title: null, description: null, checks, score: 0, linkedFrom: from };
+			const page: PageResult = { url, finalUrl: url, httpStatus: 0, title: null, description: null, checks, score: 0, linkedFrom: from, canonicalUrl: null };
 			pages.push(page);
 			opts.onEvent({ type: 'page', page });
 			return;
@@ -83,7 +119,7 @@ export async function crawlSite(startUrl: string, opts: CrawlOptions): Promise<S
 				message: `Pagina geeft ${res.status}${from.length ? ` — gelinkt vanaf ${from.length} pagina('s)` : ''}.`,
 				details: from.slice(0, 10)
 			});
-			const page: PageResult = { url, finalUrl, httpStatus: res.status, title: null, description: null, checks, score: 0, linkedFrom: from };
+			const page: PageResult = { url, finalUrl, httpStatus: res.status, title: null, description: null, checks, score: 0, linkedFrom: from, canonicalUrl: null };
 			pages.push(page);
 			opts.onEvent({ type: 'page', page });
 			return;
@@ -99,7 +135,7 @@ export async function crawlSite(startUrl: string, opts: CrawlOptions): Promise<S
 				status: 'warn',
 				message: `Pagina redirect naar een ander domein: ${finalUrl}`
 			});
-			const page: PageResult = { url, finalUrl, httpStatus: res.status, title: null, description: null, checks, score: scoreChecks(checks), linkedFrom: from };
+			const page: PageResult = { url, finalUrl, httpStatus: res.status, title: null, description: null, checks, score: scoreChecks(checks), linkedFrom: from, canonicalUrl: null };
 			pages.push(page);
 			opts.onEvent({ type: 'page', page });
 			return;
@@ -146,7 +182,8 @@ export async function crawlSite(startUrl: string, opts: CrawlOptions): Promise<S
 			description: analysis.description,
 			checks,
 			score: scoreChecks(checks),
-			linkedFrom: from
+			linkedFrom: from,
+			canonicalUrl: analysis.canonicalUrl
 		};
 		pages.push(page);
 		opts.onEvent({ type: 'page', page });
@@ -171,7 +208,11 @@ export async function crawlSite(startUrl: string, opts: CrawlOptions): Promise<S
 	const siteChecks = [
 		...(await runSiteChecks(start, pages, fetchUrl, robotsTxt, ogImages)),
 		...(await runHreflangChecks(hreflangMap, fetchUrl)),
-		...(await runDuplicateUrlChecks(start, pages, fetchUrl))
+		...(await runDuplicateUrlChecks(start, pages, fetchUrl)),
+		...(await runRedirectChainChecks(pages, walkRedirects)),
+		...runTestEnvNoindexCheck(pages),
+		...runNofollowCheck(pages),
+		...runAnalyticsChecks(pages)
 	];
 	const geo = await runGeoChecks(start, pages, fetchUrl, robotsTxt);
 	const goLive = buildGoLiveChecklist(start, pages, siteChecks);
@@ -329,6 +370,51 @@ async function runSiteChecks(
 				status: 'fail',
 				message: `${conflicts.length} pagina('s) staan in de sitemap maar ook op noindex — tegenstrijdig signaal naar Google.`,
 				details: conflicts.slice(0, 10)
+			});
+		}
+
+		// Sitemap: alleen canonieke URL's — en dekking t.o.v. de gecrawlde pagina's
+		const sitemapSet = new Set(sitemapLocs.map(safeNormalize).filter((u): u is string => u !== null));
+		const nonCanonical: string[] = [];
+		const missingFromSitemap: string[] = [];
+		for (const p of pages) {
+			if (p.httpStatus < 200 || p.httpStatus >= 300) continue;
+			const norm = safeNormalize(p.finalUrl);
+			if (!norm) continue;
+			const inSitemap = sitemapSet.has(norm);
+			if (inSitemap && p.canonicalUrl) {
+				const canonNorm = safeNormalize(p.canonicalUrl);
+				if (canonNorm && canonNorm !== norm) {
+					nonCanonical.push(`${p.finalUrl} staat in de sitemap, maar canonical wijst naar ${p.canonicalUrl}`);
+				}
+			}
+			if (!inSitemap) missingFromSitemap.push(p.finalUrl);
+		}
+		checks.push(
+			nonCanonical.length > 0
+				? {
+						id: 'sitemap-canonical-mismatch',
+						label: "Sitemap: alleen canonical URL's",
+						status: 'fail',
+						message: `${nonCanonical.length} sitemap-URL('s) zijn niet de canonical versie van die pagina.`,
+						details: nonCanonical.slice(0, 10)
+					}
+				: { id: 'sitemap-canonical-mismatch', label: "Sitemap: alleen canonical URL's", status: 'pass', message: 'Alle gecontroleerde sitemap-URL\'s zijn canoniek.' }
+		);
+		if (missingFromSitemap.length > 0) {
+			checks.push({
+				id: 'sitemap-coverage',
+				label: "Sitemap-dekking (gecrawlde pagina's)",
+				status: 'warn',
+				message: `${missingFromSitemap.length} gecrawlde pagina('s) staan niet in de sitemap. Let op: dit is gebaseerd op de crawl, niet op trafficdata — controleer de écht belangrijkste pagina's altijd met Search Console/Analytics.`,
+				details: missingFromSitemap.slice(0, 10)
+			});
+		} else {
+			checks.push({
+				id: 'sitemap-coverage',
+				label: "Sitemap-dekking (gecrawlde pagina's)",
+				status: 'pass',
+				message: 'Alle gecrawlde pagina\'s staan in de sitemap (gebaseerd op de crawl, niet op trafficdata).'
 			});
 		}
 	}
@@ -651,6 +737,139 @@ async function runDuplicateUrlChecks(
 		});
 	}
 	return checks;
+}
+
+/**
+ * Redirect chains en tijdelijke (302/307) i.p.v. permanente (301/308) redirects.
+ * Volgt een steekproef van interne redirects handmatig om tussenliggende hops te zien
+ * (de reguliere crawler gebruikt redirect:'follow' en verliest die informatie).
+ */
+async function runRedirectChainChecks(
+	pages: PageResult[],
+	walkRedirects: (url: string) => Promise<{ hops: { url: string; status: number }[]; error: boolean }>
+): Promise<Check[]> {
+	const MAX_SAMPLE = 20;
+	const redirected = pages.filter((p) => p.url !== p.finalUrl).slice(0, MAX_SAMPLE);
+	if (redirected.length === 0) return [];
+
+	const chains: string[] = [];
+	const nonPermanent: string[] = [];
+	for (const p of redirected) {
+		const { hops } = await walkRedirects(p.url);
+		if (hops.length > 1) {
+			chains.push(`${p.url} → ${hops.length} stappen → ${p.finalUrl}`);
+		}
+		const temporary = hops.filter((h) => h.status !== 301 && h.status !== 308);
+		if (temporary.length > 0) {
+			nonPermanent.push(`${p.url}: ${temporary.map((h) => h.status).join(', ')} (in plaats van 301)`);
+		}
+	}
+
+	const checks: Check[] = [];
+	checks.push(
+		chains.length > 0
+			? {
+					id: 'redirect-chains',
+					label: 'Redirect chains',
+					status: 'warn',
+					message: `${chains.length} redirect(s) gaan via meerdere stappen — los dit op tot één directe redirect.`,
+					details: chains.slice(0, 10)
+				}
+			: {
+					id: 'redirect-chains',
+					label: 'Redirect chains',
+					status: 'pass',
+					message: `Geen redirect chains gevonden (${redirected.length} redirect(s) gecheckt).`
+				}
+	);
+	checks.push(
+		nonPermanent.length > 0
+			? {
+					id: 'redirect-type',
+					label: 'Redirect-type (301 vs 302)',
+					status: 'warn',
+					message: `${nonPermanent.length} redirect(s) zijn tijdelijk (302/307) in plaats van permanent (301/308) — zoekmachines dragen ranking-signalen dan niet volledig over.`,
+					details: nonPermanent.slice(0, 10)
+				}
+			: {
+					id: 'redirect-type',
+					label: 'Redirect-type (301 vs 302)',
+					status: 'pass',
+					message: 'Alle gecontroleerde redirects zijn permanent (301/308).'
+				}
+	);
+	return checks;
+}
+
+/** Test-omgevingen horen volledig op noindex te staan; een live site juist niet. */
+function runTestEnvNoindexCheck(pages: PageResult[]): Check[] {
+	const okPages = pages.filter((p) => p.httpStatus > 0 && p.httpStatus < 400);
+	if (okPages.length === 0) return [];
+	const noindexCount = okPages.filter((p) => p.checks.some((c) => c.id === 'noindex' && c.status === 'warn')).length;
+	if (noindexCount === okPages.length) {
+		return [
+			{
+				id: 'testomgeving-noindex',
+				label: 'Testomgeving op noindex',
+				status: 'pass',
+				message: `Alle ${okPages.length} gescande pagina's staan op noindex — geschikt als afgeschermde testomgeving.`
+			}
+		];
+	}
+	if (noindexCount === 0) {
+		return [
+			{
+				id: 'testomgeving-noindex',
+				label: 'Testomgeving op noindex',
+				status: 'info',
+				message: "Geen enkele pagina staat op noindex — dit lijkt een publieke/live omgeving, geen (afgeschermde) testomgeving."
+			}
+		];
+	}
+	return [
+		{
+			id: 'testomgeving-noindex',
+			label: 'Testomgeving op noindex',
+			status: 'warn',
+			message: `${noindexCount} van ${okPages.length} pagina's staan op noindex — inconsistent voor een testomgeving.`
+		}
+	];
+}
+
+/** Dekking van robots-nofollow-metatags over de hele site. */
+function runNofollowCheck(pages: PageResult[]): Check[] {
+	const okPages = pages.filter((p) => p.httpStatus > 0 && p.httpStatus < 400);
+	const withNofollow = okPages.filter((p) => p.checks.some((c) => c.id === 'nofollow' && c.status === 'warn'));
+	if (okPages.length === 0) return [];
+	return [
+		withNofollow.length > 0
+			? {
+					id: 'nofollow-coverage',
+					label: 'Robots nofollow-meta',
+					status: 'warn',
+					message: `${withNofollow.length} pagina('s) hebben een robots-nofollow-metatag — controleer of dat bedoeld is.`,
+					details: withNofollow.slice(0, 10).map((p) => p.finalUrl)
+				}
+			: { id: 'nofollow-coverage', label: 'Robots nofollow-meta', status: 'pass', message: 'Geen enkele pagina heeft een robots-nofollow-metatag.' }
+	];
+}
+
+/** Dekking van Analytics/Tag Manager over de hele site. */
+function runAnalyticsChecks(pages: PageResult[]): Check[] {
+	const okPages = pages.filter((p) => p.httpStatus > 0 && p.httpStatus < 400 && p.checks.some((c) => c.id === 'analytics'));
+	if (okPages.length === 0) return [];
+	const missing = okPages.filter((p) => p.checks.some((c) => c.id === 'analytics' && c.status === 'warn'));
+	return [
+		missing.length > 0
+			? {
+					id: 'analytics-coverage',
+					label: 'Analytics-dekking',
+					status: 'fail',
+					message: `${missing.length} van ${okPages.length} pagina's missen Google Analytics of Tag Manager.`,
+					details: missing.slice(0, 10).map((p) => p.finalUrl)
+				}
+			: { id: 'analytics-coverage', label: 'Analytics-dekking', status: 'pass', message: `Alle ${okPages.length} pagina's hebben Google Analytics of Tag Manager.` }
+	];
 }
 
 // Bron: AI user-agent landscape, april 2026 (nohacks.co)

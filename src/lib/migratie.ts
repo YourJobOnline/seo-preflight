@@ -2,6 +2,42 @@
 
 import type { Check } from './types';
 
+/** Waarom een item niet (volledig) automatisch te checken is — voor de Actiepunten-lijst. */
+export type ManualReason =
+	| 'overleg'
+	| 'deliverable'
+	| 'data'
+	| 'gsc'
+	| 'extern'
+	| 'deployment'
+	| 'proces'
+	| 'vergelijking'
+	| 'oude-site';
+
+export const MANUAL_REASON_ICON: Record<ManualReason, string> = {
+	overleg: '👥',
+	deliverable: '📄',
+	data: '📊',
+	gsc: '🔍',
+	extern: '🛠️',
+	deployment: '🚀',
+	proces: '🔁',
+	vergelijking: '⚖️',
+	'oude-site': '🕸️'
+};
+
+export const MANUAL_REASON_LABEL: Record<ManualReason, string> = {
+	overleg: 'Handmatige beoordeling / overleg nodig',
+	deliverable: 'Extern deliverable (bestand/script)',
+	data: 'Vereist trafficdata (Analytics/Search Console)',
+	gsc: 'Vereist toegang tot Search Console',
+	extern: 'Extern tool, niet in deze scan geïntegreerd (bijv. WebPageTest)',
+	deployment: 'Deploy-actie: upload/publiceer en scan daarna opnieuw',
+	proces: 'Doorlopend proces of pas te checken na livegang',
+	vergelijking: 'Vergelijking oude vs. nieuwe site — nog niet ondersteund in de scan',
+	'oude-site': 'Scan hiervoor de huidige (oude) site'
+};
+
 export interface MigratieItem {
 	id: string;
 	taak: string;
@@ -9,6 +45,8 @@ export interface MigratieItem {
 	auto?: string[];
 	/** Item is ook ok als geen van de auto-checks in het resultaat zit (checks die alleen bij problemen verschijnen). */
 	autoAbsentOk?: boolean;
+	/** Waarom dit item (zonder auto-koppeling) niet automatisch te checken is. */
+	manualReason?: ManualReason;
 }
 
 export interface MigratieCategorie {
@@ -114,7 +152,8 @@ export function applyAuditToChecklist(allChecks: Check[], state: MigratieState):
 				const item = state.items[def.id];
 				if (!item) continue;
 
-				const relevant = allChecks.filter((c) => def.auto!.includes(c.id));
+				// 'info' betekent "niet vast te stellen" (bijv. geen noindex ergens vastgesteld) — telt niet als pass/fail
+				const relevant = allChecks.filter((c) => def.auto!.includes(c.id) && c.status !== 'info');
 				if (relevant.length === 0) {
 					if (def.autoAbsentOk) {
 						item.done = true;
@@ -141,6 +180,41 @@ export function applyAuditToChecklist(allChecks: Check[], state: MigratieState):
 	return result;
 }
 
+export interface ActionItem {
+	faseTitel: string;
+	catTitel: string;
+	id: string;
+	taak: string;
+	wie: Verantwoordelijke;
+	opmerking: string;
+	isAuto: boolean;
+	manualReason?: ManualReason;
+}
+
+/** Alle nog niet-afgevinkte items, voor de Actiepunten-samenvatting. */
+export function getActionItems(state: MigratieState): ActionItem[] {
+	const result: ActionItem[] = [];
+	for (const fase of MIGRATIE_CHECKLIST) {
+		for (const cat of fase.categorieen) {
+			for (const def of cat.items) {
+				const s = state.items[def.id];
+				if (!s || s.done) continue;
+				result.push({
+					faseTitel: fase.titel,
+					catTitel: cat.titel,
+					id: def.id,
+					taak: def.taak,
+					wie: s.wie,
+					opmerking: s.opmerking,
+					isAuto: !!def.auto,
+					manualReason: def.manualReason
+				});
+			}
+		}
+	}
+	return result;
+}
+
 export const MIGRATIE_CHECKLIST: MigratieFase[] = [
 	{
 		id: 'voorbereiding',
@@ -150,12 +224,12 @@ export const MIGRATIE_CHECKLIST: MigratieFase[] = [
 				id: 'algemeen',
 				titel: 'Algemeen',
 				items: [
-					{ id: 'stakeholders', taak: 'Inventarisatie stakeholders: wie zijn er betrokken en wat is ieders rol?' },
-					{ id: 'doelen', taak: "Doelen en KPI's afstemmen: wanneer is de migratie succesvol?" },
-					{ id: 'planning', taak: 'Migratiemoment realistisch plannen (minimaal 3 maanden, anders no-go)' },
-					{ id: 'redirectplan', taak: 'Redirectplan opmaken' },
-					{ id: 'inplannen', taak: 'Inplannen + opzetten migratie' },
-					{ id: 'top500', taak: 'Top 500 URL\'s check (indicatief — ga voor 80–90% van traffic/best converterend)' }
+					{ id: 'stakeholders', taak: 'Inventarisatie stakeholders: wie zijn er betrokken en wat is ieders rol?', manualReason: 'overleg' },
+					{ id: 'doelen', taak: "Doelen en KPI's afstemmen: wanneer is de migratie succesvol?", manualReason: 'overleg' },
+					{ id: 'planning', taak: 'Migratiemoment realistisch plannen (minimaal 3 maanden, anders no-go)', manualReason: 'overleg' },
+					{ id: 'redirectplan', taak: 'Redirectplan opmaken', manualReason: 'deliverable' },
+					{ id: 'inplannen', taak: 'Inplannen + opzetten migratie', manualReason: 'overleg' },
+					{ id: 'top500', taak: 'Top 500 URL\'s check (indicatief — ga voor 80–90% van traffic/best converterend)', manualReason: 'data' }
 				]
 			},
 			{
@@ -164,20 +238,20 @@ export const MIGRATIE_CHECKLIST: MigratieFase[] = [
 				items: [
 					{ id: 'nieuwe-sitemap', taak: 'Nieuwe sitemap.xml', auto: ['sitemap'] },
 					{ id: 'sitemap-root', taak: 'Uploaden/updaten van nieuwe sitemap.xml in de root van de website', auto: ['sitemap'] },
-					{ id: 'sitemap-canonical', taak: 'Gebruik alleen de canonical URL\'s in de sitemap', auto: ['sitemap', 'sitemap-noindex'] },
-					{ id: 'sitemap-opbouw', taak: 'Gebruik dezelfde opbouw als de website' },
-					{ id: 'sitemap-top500', taak: 'Controle of top 500 pagina\'s in sitemap.xml zijn opgenomen' },
-					{ id: 'sitemap-gsc', taak: 'Controle of de sitemap goed wordt opgepakt binnen Google Search Console' },
-					{ id: 'sitemap-structuur', taak: 'Check structuur binnen de sitemap' }
+					{ id: 'sitemap-canonical', taak: 'Gebruik alleen de canonical URL\'s in de sitemap', auto: ['sitemap-canonical-mismatch'] },
+					{ id: 'sitemap-opbouw', taak: 'Gebruik dezelfde opbouw als de website', manualReason: 'overleg' },
+					{ id: 'sitemap-top500', taak: 'Controle of top 500 pagina\'s in sitemap.xml zijn opgenomen', auto: ['sitemap-coverage'] },
+					{ id: 'sitemap-gsc', taak: 'Controle of de sitemap goed wordt opgepakt binnen Google Search Console', manualReason: 'gsc' },
+					{ id: 'sitemap-structuur', taak: 'Check structuur binnen de sitemap', manualReason: 'overleg' }
 				]
 			},
 			{
 				id: '404',
 				titel: '404-meldingen in kaart brengen',
 				items: [
-					{ id: '404-huidig', taak: 'Belangrijkste huidige 404-meldingen in kaart brengen' },
-					{ id: '404-redirect', taak: 'Redirecten van de belangrijkste foutmeldingen en meenemen in URL-mapping' },
-					{ id: '404-nieuw', taak: 'Nieuwe 404\'s die ontstaan op korte termijn oppakken en redirecten' }
+					{ id: '404-huidig', taak: 'Belangrijkste huidige 404-meldingen in kaart brengen', manualReason: 'oude-site' },
+					{ id: '404-redirect', taak: 'Redirecten van de belangrijkste foutmeldingen en meenemen in URL-mapping', manualReason: 'deliverable' },
+					{ id: '404-nieuw', taak: 'Nieuwe 404\'s die ontstaan op korte termijn oppakken en redirecten', manualReason: 'proces' }
 				]
 			},
 			{
@@ -185,29 +259,29 @@ export const MIGRATIE_CHECKLIST: MigratieFase[] = [
 				titel: 'Performance check',
 				items: [
 					{ id: 'psi-templates', taak: 'Check PageSpeed-score van Google van de verschillende templates', auto: ['vitals-performance'] },
-					{ id: 'nulmeting', taak: 'Maak een nulmeting van performance van verschillende templates met WebPageTest' },
-					{ id: 'verbeterpunten', taak: 'Toelichting + controle van technische verbeterpunten om mee te nemen in de nieuwe website' }
+					{ id: 'nulmeting', taak: 'Maak een nulmeting van performance van verschillende templates met WebPageTest', manualReason: 'extern' },
+					{ id: 'verbeterpunten', taak: 'Toelichting + controle van technische verbeterpunten om mee te nemen in de nieuwe website', manualReason: 'overleg' }
 				]
 			},
 			{
 				id: 'rankings',
 				titel: 'Rankings',
 				items: [
-					{ id: 'rankings-focus', taak: 'Rankings checken van focuszoekwoorden (Search Console)' },
-					{ id: 'rankings-alle', taak: 'Rankings checken van alle zoekwoorden (Search Console)' }
+					{ id: 'rankings-focus', taak: 'Rankings checken van focuszoekwoorden (Search Console)', manualReason: 'gsc' },
+					{ id: 'rankings-alle', taak: 'Rankings checken van alle zoekwoorden (Search Console)', manualReason: 'gsc' }
 				]
 			},
 			{
 				id: 'techniek',
 				titel: 'Technische elementen',
 				items: [
-					{ id: 'urlstructuur', taak: 'Inzichtelijk maken van nieuwe URL-structuur' },
-					{ id: 'structuur-klant', taak: 'Nieuwe websitestructuur gezamenlijk met klant bespreken' },
-					{ id: 'url-top500', taak: 'Check URL-structuur van belangrijkste top 500 pagina\'s' },
-					{ id: 'indexatie-webbouwer', taak: 'In samenspraak met webbouwers passende oplossingen bespreken voor goede indexatie' },
-					{ id: 'template-elementen', taak: 'Voorstel doen voor passende elementen van de verschillende templates' },
-					{ id: 'content-structuur', taak: 'Inzichtelijk maken of voor de top 500 pagina\'s iets verandert aan de contentstructuur' },
-					{ id: 'content-templates', taak: 'Contentmogelijkheden checken bij verschillende templates' },
+					{ id: 'urlstructuur', taak: 'Inzichtelijk maken van nieuwe URL-structuur', manualReason: 'overleg' },
+					{ id: 'structuur-klant', taak: 'Nieuwe websitestructuur gezamenlijk met klant bespreken', manualReason: 'overleg' },
+					{ id: 'url-top500', taak: 'Check URL-structuur van belangrijkste top 500 pagina\'s', manualReason: 'data' },
+					{ id: 'indexatie-webbouwer', taak: 'In samenspraak met webbouwers passende oplossingen bespreken voor goede indexatie', manualReason: 'overleg' },
+					{ id: 'template-elementen', taak: 'Voorstel doen voor passende elementen van de verschillende templates', manualReason: 'overleg' },
+					{ id: 'content-structuur', taak: 'Inzichtelijk maken of voor de top 500 pagina\'s iets verandert aan de contentstructuur', manualReason: 'overleg' },
+					{ id: 'content-templates', taak: 'Contentmogelijkheden checken bij verschillende templates', manualReason: 'overleg' },
 					{
 						id: 'hreflang',
 						taak: 'Hreflang-elementen instellen (bij meertalige websites)',
@@ -219,26 +293,36 @@ export const MIGRATIE_CHECKLIST: MigratieFase[] = [
 				id: 'redirectmapping',
 				titel: 'Redirectmapping',
 				items: [
-					{ id: 'redirects-top500', taak: 'Controleren van alle redirects met focus op de 500 belangrijkste pagina\'s' },
-					{ id: 'redirects-overzicht', taak: 'In kaart brengen van alle huidige en nieuwe redirects' },
-					{ id: 'redirect-chains', taak: 'Controleren of er redirect chains zijn en deze gelijk oplossen bij migratie' }
+					{ id: 'redirects-top500', taak: 'Controleren van alle redirects met focus op de 500 belangrijkste pagina\'s', manualReason: 'data' },
+					{ id: 'redirects-overzicht', taak: 'In kaart brengen van alle huidige en nieuwe redirects', manualReason: 'deliverable' },
+					{
+						id: 'redirect-chains',
+						taak: 'Controleren of er redirect chains zijn en deze gelijk oplossen bij migratie',
+						auto: ['redirect-chains'],
+						autoAbsentOk: true
+					}
 				]
 			},
 			{
 				id: 'mapping',
 				titel: 'Mapping-proces',
 				items: [
-					{ id: 'mapping-meedenken', taak: 'Meedenken met praktische redirect-oplossingen' },
-					{ id: 'mapping-controle', taak: 'Controleren van redirects' },
-					{ id: 'mapping-testen', taak: 'Uitvoer + testen van redirects' },
-					{ id: 'redirect-script', taak: 'Eventueel ontwikkelen van een redirect-script (voor duizenden URL\'s in één keer)' }
+					{ id: 'mapping-meedenken', taak: 'Meedenken met praktische redirect-oplossingen', manualReason: 'overleg' },
+					{
+						id: 'mapping-controle',
+						taak: 'Controleren van redirects',
+						auto: ['redirect-chains', 'redirect-type'],
+						autoAbsentOk: true
+					},
+					{ id: 'mapping-testen', taak: 'Uitvoer + testen van redirects', manualReason: 'deliverable' },
+					{ id: 'redirect-script', taak: 'Eventueel ontwikkelen van een redirect-script (voor duizenden URL\'s in één keer)', manualReason: 'deliverable' }
 				]
 			},
 			{
 				id: 'testen',
 				titel: 'Testen',
 				items: [
-					{ id: 'testomgeving', taak: 'Testomgeving beschikbaar en op noindex?' },
+					{ id: 'testomgeving', taak: 'Testomgeving beschikbaar en op noindex?', auto: ['testomgeving-noindex'] },
 					{ id: 'test-redirects', taak: 'Controleren van redirects in deze fase', auto: ['redirect-links'], autoAbsentOk: true },
 					{ id: 'test-slash', taak: 'Check URL\'s op "/" en geen "/"', auto: ['duplicate-urls'] },
 					{ id: 'test-www', taak: 'Check URL\'s op www. en non-www.', auto: ['duplicate-urls'] },
@@ -247,9 +331,9 @@ export const MIGRATIE_CHECKLIST: MigratieFase[] = [
 					{ id: 'test-sitemap', taak: 'Sitemap.xml ok?', auto: ['sitemap', 'sitemap-hosts'] },
 					{ id: 'test-dode-links', taak: 'Controle op dode links (crawl van de testomgeving)', auto: ['broken-links'] },
 					{ id: 'test-structured-data', taak: 'Structured data aanwezig?', auto: ['geo-structured-data'] },
-					{ id: 'test-redirects-def', taak: 'Definitieve redirects opleveren' },
-					{ id: 'test-robots-upload', taak: 'Robots.txt aanpassen en uploaden' },
-					{ id: 'test-sitemap-opleveren', taak: 'Opleveren van (nieuwe) sitemap.xml' },
+					{ id: 'test-redirects-def', taak: 'Definitieve redirects opleveren', manualReason: 'deliverable' },
+					{ id: 'test-robots-upload', taak: 'Robots.txt aanpassen en uploaden', manualReason: 'deployment' },
+					{ id: 'test-sitemap-opleveren', taak: 'Opleveren van (nieuwe) sitemap.xml', manualReason: 'deployment' },
 					{ id: 'test-performance', taak: 'Nogmaals check van testomgeving-URL\'s in WebPageTest en PageSpeed-score', auto: ['vitals-performance'] }
 				]
 			}
@@ -267,16 +351,16 @@ export const MIGRATIE_CHECKLIST: MigratieFase[] = [
 					{ id: 'live-sitemap', taak: 'Nieuwe sitemap uploaden in de root van de website', auto: ['sitemap', 'sitemap-hosts'] },
 					{ id: 'live-robots', taak: 'Afwijkingen in het robots.txt-bestand', auto: ['robots'] },
 					{ id: 'live-noindex', taak: '"robots noindex" metatags op pagina\'s', auto: ['golive-noindex'] },
-					{ id: 'live-nofollow', taak: '"robots nofollow" metatags in de broncode' },
-					{ id: 'live-301', taak: '302-redirects in plaats van 301-redirects' },
-					{ id: 'live-gsc', taak: 'Verifieer Search Console op fouten' },
+					{ id: 'live-nofollow', taak: '"robots nofollow" metatags in de broncode', auto: ['nofollow-coverage'] },
+					{ id: 'live-301', taak: '302-redirects in plaats van 301-redirects', auto: ['redirect-type'], autoAbsentOk: true },
+					{ id: 'live-gsc', taak: 'Verifieer Search Console op fouten', manualReason: 'gsc' },
 					{ id: 'live-sitemap-fouten', taak: 'Verifieer XML-sitemap op fouten', auto: ['sitemap', 'sitemap-hosts', 'sitemap-noindex'] },
-					{ id: 'live-migratie', taak: 'Ontbrekende of verkeerd gemigreerde pagina\'s' },
+					{ id: 'live-migratie', taak: 'Ontbrekende of verkeerd gemigreerde pagina\'s', manualReason: 'data' },
 					{ id: 'live-404', taak: 'Zorg ervoor dat de 404-pagina ook een 404-statuscode geeft', auto: ['soft-404'] },
-					{ id: 'live-analytics', taak: 'Zorg dat de Analytics-trackingcode op alle pagina\'s aanwezig en goed ingericht is' },
-					{ id: 'live-performance', taak: 'Vergelijk de site-performance van de nieuwe site met de oude (alle typen pagina\'s)' },
-					{ id: 'live-wijzigingen', taak: 'Wijzigingen doorvoeren op basis van bovenstaande checks' },
-					{ id: 'live-adreswijziging', taak: 'Bij wijziging in domeinnaam of ccTLD: adreswijziging toevoegen in Search Console' }
+					{ id: 'live-analytics', taak: 'Zorg dat de Analytics-trackingcode op alle pagina\'s aanwezig en goed ingericht is', auto: ['analytics-coverage'] },
+					{ id: 'live-performance', taak: 'Vergelijk de site-performance van de nieuwe site met de oude (alle typen pagina\'s)', manualReason: 'vergelijking' },
+					{ id: 'live-wijzigingen', taak: 'Wijzigingen doorvoeren op basis van bovenstaande checks', manualReason: 'proces' },
+					{ id: 'live-adreswijziging', taak: 'Bij wijziging in domeinnaam of ccTLD: adreswijziging toevoegen in Search Console', manualReason: 'gsc' }
 				]
 			}
 		]

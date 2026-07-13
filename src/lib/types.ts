@@ -17,6 +17,7 @@ export interface PageResult {
 	checks: Check[];
 	score: number;
 	linkedFrom: string[];
+	canonicalUrl: string | null;
 }
 
 export interface SiteResult {
